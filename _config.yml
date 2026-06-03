@@ -1,0 +1,28 @@
+title: "sangil.dev"
+description: "개발 회고 & 기술 블로그"
+author:
+  name: sangil6372
+  email: ssanggil6372@gmail.com
+
+url: "https://sangil6372.github.io"
+baseurl: ""
+
+theme: minima
+
+permalink: /:year/:month/:day/:title/
+
+markdown: kramdown
+highlighter: rouge
+
+plugins:
+  - jekyll-feed
+  - jekyll-sitemap
+
+minima:
+  skin: dark
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - node_modules
+  - vendor
