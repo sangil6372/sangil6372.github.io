@@ -10,6 +10,7 @@ baseurl: ""
 theme: minima
 
 permalink: /:year/:month/:day/:title/
+future: true
 
 markdown: kramdown
 highlighter: rouge
