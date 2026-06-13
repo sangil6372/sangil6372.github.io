@@ -14,11 +14,90 @@ Chrome 확장 프로그램은 이번이 처음이었다. 브라우저 API를 코
 
 ---
 
-## Chrome 확장 프로그램 구조 — 처음 알게 된 것들
+## Chrome 확장 프로그램이 실제로 어떻게 동작하는가
 
-### Manifest V3
+확장 프로그램을 처음 만들 때 가장 먼저 든 의문이 이것이었다. `content.js`를 작성하고 `manifest.json`에 등록하면 코레일 페이지에 UI가 생기는데 — **실제로 어떤 과정을 거쳐서?**
 
-현재 Chrome 확장 프로그램의 표준 스펙이다. `manifest.json`이 모든 것의 시작점이다.
+### 1단계: 설치 = Chrome에 파일 경로 등록
+
+`chrome://extensions`에서 "압축해제된 확장 프로그램 로드"를 하면 Chrome은 해당 폴더를 **확장 프로그램 패키지**로 인식하고 고유 ID를 부여한다. 이 ID는 `chrome-extension://[id]/` 형태의 전용 URL 스킴의 루트가 된다.
+
+```
+chrome-extension://abcdefghijklmnop/manifest.json
+chrome-extension://abcdefghijklmnop/content.js
+chrome-extension://abcdefghijklmnop/worker.js
+```
+
+확장 프로그램 파일들은 이 URL로만 접근 가능한 별도 공간에 존재한다. 일반 웹 페이지에서 `fetch('chrome-extension://...')`를 직접 날리면 차단된다.
+
+### 2단계: URL 매칭 → 스크립트 주입
+
+사용자가 `https://www.korail.com/ticket/...` 페이지를 열면, Chrome은 모든 설치된 확장 프로그램의 `manifest.json`을 순회하며 `content_scripts[].matches` 목록과 현재 URL을 대조한다. 패턴이 맞으면 페이지 로딩 직후 해당 JS/CSS를 그 탭에 **주입(inject)** 한다.
+
+"주입"이 실제로 의미하는 것은, Chrome이 해당 탭의 렌더러 프로세스에 스크립트 실행 명령을 보내는 것이다. 개발자 도구 콘솔에서 JS를 직접 붙여넣고 실행하는 것과 메커니즘이 유사하다. 차이는 개발자 도구는 사람이 수동으로 트리거하지만, content script는 URL 조건이 맞을 때 Chrome이 자동으로 실행한다는 점이다.
+
+`style.css`도 같은 방식으로 주입된다. Chrome이 페이지 `<head>`에 `<style>` 태그를 삽입하는 것과 동일한 효과다. 실제로 개발자 도구 Elements 탭을 보면 `<style>` 태그가 생긴 것을 확인할 수 있다.
+
+### 3단계: Isolated World — 같은 DOM, 다른 JS 컨텍스트
+
+여기서 핵심 개념이 하나 있다. Content script는 **페이지의 DOM은 공유하지만, JavaScript 실행 컨텍스트는 분리된다.**
+
+```
+┌─────────────────────────────────────────────────┐
+│                  브라우저 탭                      │
+│                                                 │
+│  ┌───────────────────┐   ┌──────────────────┐  │
+│  │  코레일 페이지 JS  │   │   content.js     │  │
+│  │                   │   │   (내 코드)       │  │
+│  │  window.pageVar   │   │  window.myVar    │  │
+│  │  korail.func()    │   │  isMacroRunning  │  │
+│  └────────┬──────────┘   └────────┬─────────┘  │
+│           │    서로 접근 불가       │            │
+│           └──────────┬────────────┘            │
+│                      ↓                         │
+│               공유 DOM (document)               │
+│           document.querySelector(...)          │
+│           element.click(), innerHTML 등         │
+└─────────────────────────────────────────────────┘
+```
+
+- `content.js`에서 `document.querySelector('.btn')`을 쓰면 코레일 페이지의 버튼을 그대로 잡을 수 있다.
+- 하지만 코레일 페이지 JS가 선언한 `window.someVar`나 함수는 `content.js`에서 직접 읽을 수 없다. JS 전역 스코프가 별개다.
+
+이 격리(Isolated World) 덕분에 내 매크로 변수가 코레일 페이지 JS와 이름 충돌을 일으키지 않는다. 반대로, 코레일 JS가 실수로 내 변수를 덮어쓰는 일도 없다.
+
+### 4단계: web_accessible_resources — 확장 파일을 페이지 컨텍스트에서 참조하기
+
+Content script에서 Web Worker를 생성할 때 한 가지 문제가 생겼다.
+
+```javascript
+// 이렇게 쓰면 동작하지 않는다
+const worker = new Worker('./worker.js');
+// => korail.com/worker.js 를 찾으려 하므로 404
+```
+
+`new Worker()`에 상대 경로를 넘기면 현재 페이지(`korail.com`) 기준으로 파일을 찾는다. `chrome.runtime.getURL('worker.js')`를 쓰면 `chrome-extension://[id]/worker.js` 전체 경로를 반환해준다.
+
+그런데 보안상 이유로 외부 페이지 컨텍스트에서 `chrome-extension://` 경로에 아무 파일이나 접근할 수는 없다. **`manifest.json`의 `web_accessible_resources`에 명시된 파일만** 허용한다.
+
+```json
+"web_accessible_resources": [
+  {
+    "resources": ["worker.js"],
+    "matches": ["https://www.korail.com/*"]
+  }
+]
+```
+
+이 선언이 있어야 아래 코드가 정상 동작한다.
+
+```javascript
+const worker = new Worker(chrome.runtime.getURL('worker.js')); // ✅
+```
+
+`matches`를 `korail.com`으로 좁힌 이유도 있다. 다른 도메인 페이지에서 내 Worker 파일을 참조하는 걸 막기 위해서다.
+
+### 정리: manifest.json 각 필드가 하는 일
 
 ```json
 {
@@ -27,7 +106,8 @@ Chrome 확장 프로그램은 이번이 처음이었다. 브라우저 API를 코
   "permissions": ["storage"],
   "content_scripts": [
     {
-      "matches": ["https://www.korail.com/ticket/*"],
+      "matches": ["https://www.korail.com/ticket/*",
+                  "https://www.korail.com/member/*"],
       "js": ["content.js"],
       "css": ["style.css"]
     }
@@ -41,11 +121,12 @@ Chrome 확장 프로그램은 이번이 처음이었다. 브라우저 API를 코
 }
 ```
 
-**content_scripts** — 지정한 URL 패턴에 해당하는 페이지가 열릴 때 자동으로 주입되는 JS/CSS다. 일반 웹 페이지 DOM에 접근할 수 있다. 이 프로젝트에서는 `content.js` 하나가 UI 렌더링부터 예매 자동화까지 전부 담당한다.
-
-**web_accessible_resources** — content script에서 `chrome.runtime.getURL()`로 확장 프로그램 내부 파일에 접근하려면 여기에 명시해야 한다. `worker.js`를 Web Worker로 로드할 때 이게 필요하다.
-
-**permissions** — 최소 권한 원칙. `storage`만 선언했다. `notifications`는 Manifest V3에서 content script에서 직접 `new Notification()`으로 사용할 수 있어서 별도 권한 선언이 불필요했다.
+| 필드 | 역할 |
+|------|------|
+| `permissions` | Chrome API 사용 권한 선언. 설치 시 사용자에게 고지되는 항목 |
+| `content_scripts.matches` | 스크립트를 주입할 URL 패턴. `/member/*`는 세션 만료 감지용 |
+| `content_scripts.js/css` | 주입할 파일 목록. DOM 조작과 UI 스타일링 |
+| `web_accessible_resources` | 페이지 컨텍스트에서 `chrome.runtime.getURL()`로 접근 허용할 파일 |
 
 ---
 
@@ -94,6 +175,8 @@ function holdWakeLock() {
 ### 문제 2 — 새로고침 후 상태 복원
 
 예매 시도 → 페이지 reload → 매크로 상태 초기화. 이 사이클을 처리해야 했다.
+
+페이지를 새로고침하면 content script도 처음부터 다시 실행된다. JS 메모리에 있던 변수는 전부 사라진다. 매크로가 실행 중이었다는 사실을 어딘가에 남겨야 한다.
 
 **해결: sessionStorage로 상태 지속**
 
@@ -149,7 +232,7 @@ function getJitteredDelay(baseMs) {
 }
 ```
 
-3초 간격으로 설정하면 실제로는 1.8초~4.2초 사이에서 랜덤하게 동작한다. 서버 입장에서 사람의 행동과 구별하기 어렵게 만드는 의도다.
+3초 간격으로 설정하면 실제로는 1.8초~4.2초 사이에서 랜덤하게 동작한다.
 
 ---
 
@@ -171,7 +254,7 @@ function getJitteredDelay(baseMs) {
 
 ## 처음 Chrome 확장 프로그램을 만들면서 느낀 것
 
-웹 개발 경험이 있어도 확장 프로그램은 다른 맥락이 있다. 페이지 JS가 아니라 브라우저 위에서 동작하는 코드를 쓰는 느낌이랄까.
+웹 개발 경험이 있어도 확장 프로그램은 다른 맥락이 있다. 처음엔 "그냥 JS 파일 하나 끼워 넣는 거 아닌가?" 싶었는데, Isolated World 개념, `chrome-extension://` URL 스킴, web_accessible_resources 접근 제어 같은 것들이 하나하나 이유가 있었다.
 
 가장 인상 깊었던 건 **브라우저가 생각보다 훨씬 많은 것을 제한한다**는 점이다. 백그라운드 탭 타이머 제한, intensive throttling, Web Worker의 별도 글로벌 컨텍스트 등 — 일반 웹 개발에서는 신경 쓰지 않았던 제약들이 여기서는 핵심 문제가 됐다.
 
